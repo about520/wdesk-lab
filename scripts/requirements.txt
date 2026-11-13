@@ -1,0 +1,10 @@
+# 你的任务需要什么库就写在这里，workflow 会自动装。
+# 示例脚本只用标准库，所以这里是空的。
+#
+# 常用的一些，去掉 # 就能用：
+# requests
+# beautifulsoup4
+# pandas
+# numpy
+# pillow
+# yt-dlp

@@ -1,0 +1,65 @@
+name: 开一台临时交互式机器（SSH）
+
+# 跑起来之后会给你一个 ssh 连接串：
+#   一台 2 核 / 7G 内存 / 40G 盘的 Ubuntu，随便装随便玩。
+# 连接串会自动贴到本仓库的 Issues 里（标题 MACHINE-xxxx），随时能翻。
+# 单个 job 最长约 6 小时，到点自动销毁。
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_minutes:
+        description: '保持连接多少分钟（上限 350）'
+        required: false
+        default: '180'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  shell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 预装点常用东西
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tmux htop vim curl wget git jq unzip ripgrep net-tools
+
+      - name: 装 tmate
+        run: |
+          if ! sudo apt-get install -y -qq tmate; then
+            curl -fsSL -o /tmp/tmate.tar.xz \
+              https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz
+            sudo tar -xJf /tmp/tmate.tar.xz -C /usr/local/bin --strip-components=1
+          fi
+          tmate -V
+
+      - name: 开 SSH 会话并把连接串贴到 Issues
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ inputs.keep_minutes }}
+        run: |
+          set -e
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+          SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
+          WEB=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
+          echo "::notice::SSH = $SSH"
+          echo "SSH = $SSH"
+
+          BODY=$'连进去就是一台 2核/7G/40G 的 Ubuntu，装什么随便装。\n\n**SSH 连接串（复制这一行）：**\n```\n'"$SSH"$'\n```\n\n**浏览器里直接开终端：**\n'"$WEB"$'\n\n最长 '"${KEEP:-180}"$' 分钟，到点自动销毁。'
+          jq -n --arg t "MACHINE $(date -u +%m-%d\ %H:%M)" --arg b "$BODY" \
+            '{title:$t, body:$b}' > /tmp/issue.json
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${GITHUB_REPOSITORY}/issues \
+            -d @/tmp/issue.json > /dev/null && echo "连接串已贴到 Issues"
+
+          echo "倒计时开始：${KEEP:-180} 分钟"
+          sleep $((${KEEP:-180} * 60)) || true
+          echo "机器回收"

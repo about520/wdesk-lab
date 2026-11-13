@@ -1,0 +1,46 @@
+name: 手动跑命令
+
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: '要执行的命令（比如 python scripts/hello.py）'
+        required: true
+        default: 'python scripts/hello.py'
+      minutes:
+        description: '最长运行分钟数（上限 350）'
+        required: false
+        default: '30'
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 装依赖
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f scripts/requirements.txt ]; then pip install -r scripts/requirements.txt; fi
+
+      - name: 跑活（超时会自动掐掉）
+        run: |
+          timeout --signal=TERM ${{ inputs.minutes }}m bash -c "${{ inputs.command }}"
+        continue-on-error: true
+
+      - name: 收集产出
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: output-${{ github.run_number }}
+          path: |
+            output/
+            *.log
+          if-no-files-found: warn
+          retention-days: 14

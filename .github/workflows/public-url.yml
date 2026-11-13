@@ -1,0 +1,44 @@
+name: 起个服务拿到临时公网地址
+
+# runner 本身没有公网入口，但可以用 cloudflared 的免费隧道，
+# 把一个临时公网 https 地址映射到你机器上跑的服务。
+# 适合临时演示、给自己手机访问、给朋友看一眼。
+# 地址是随机的，job 结束服务就没了。
+
+on:
+  workflow_dispatch:
+    inputs:
+      keep_minutes:
+        description: '保持多少分钟（上限 350）'
+        required: false
+        default: '60'
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载 cloudflared
+        run: |
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: 起服务 + 打隧道
+        run: |
+          # 把你自己的服务替换掉这一行，比如 python app.py
+          python3 -m http.server 8000 --directory . &
+          sleep 2
+
+          cloudflared tunnel --url http://localhost:8000 --no-autoupdate > /tmp/cf.log 2>&1 &
+          sleep 20
+
+          URL=$(grep -o 'https://[a-z0-9-]*\.trycloudflare\.com' /tmp/cf.log | head -n 1)
+          echo "对外地址: $URL"
+          echo "### 对外地址: $URL" >> $GITHUB_STEP_SUMMARY
+
+          # 保持住，别让 job 立刻结束
+          sleep $(( ${{ inputs.keep_minutes }} * 60 ))

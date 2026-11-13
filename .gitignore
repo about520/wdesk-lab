@@ -1,0 +1,18 @@
+# 运行产出，不需要进仓库
+output/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编译中间产物
+dist/
+build/
+*.spec
+
+# 系统垃圾
+.DS_Store
+Thumbs.db

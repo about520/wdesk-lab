@@ -1,0 +1,43 @@
+name: 三平台编译
+
+# 一次跑出 Linux / Windows / macOS 三个版本，
+# 拿来编译自己的程序最省事，本地不用装任何工具链。
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x64
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-latest
+            name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 编译（示例：把脚本打成单文件可执行程序）
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+          pyinstaller --onefile --distpath dist scripts/hello.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.name }}
+          path: dist/
+          if-no-files-found: error
