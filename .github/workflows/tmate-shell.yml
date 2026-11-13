@@ -1,10 +1,10 @@
 name: 开一台临时交互式机器（SSH）
 
-# 跑起来会给你一个能登进去的入口，两种形态，能拿到哪个给哪个：
-#   ① SSH 连接串（ssh xxxx@nyc1.tmate.io）
-#   ② 网页终端地址（浏览器打开直接就是命令行，手机上也能用）
-# 入口地址会自动贴到本仓库的 Issues 里（标题 MACHINE-...），随时能翻。
-# 机器是 2 核 / 7G 内存 / 40G 盘，单个 job 最长约 6 小时，到点自动销毁。
+# 跑起来给你一个能登进去的入口：
+#   ① 网页终端地址（浏览器打开直接是命令行，手机也行）
+#   ② 能连上时给 SSH 连接串
+# 地址会自动贴到本仓库 Issues 里（标题 MACHINE-...），随时能翻。
+# 机器 2核 / 7G 内存 / 40G 盘，单个 job 最长约 6 小时，到点自动销毁。
 
 on:
   workflow_dispatch:
@@ -15,7 +15,7 @@ on:
         default: '180'
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 jobs:
@@ -29,81 +29,81 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq tmux htop vim curl wget git jq unzip ripgrep net-tools tmate || true
-          tmate -V || echo "apt 版 tmate 不可用"
 
       - name: 开机器并公布入口
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP: ${{ inputs.keep_minutes }}
         run: |
+          set -uo pipefail
           API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
-
-          gh_post() {  # $1=url $2=json
-            curl -sf -X POST -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" "$1" -d "$2"
-          }
-          gh_patch() { # $1=url $2=json
-            curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" "$1" -d "$2"
-          }
-
+          CH="https://ntfy.sh/zakabox-a7f3d29c5b"
           TITLE="MACHINE $(date -u '+%m-%d %H:%M UTC')"
-          START=$(date -u '+%H:%M:%S')
-          ISSUE=$(jq -n --arg t "$TITLE" \
-              --arg b "机器启动中（$START UTC），等 1-2 分钟…" \
-              '{title:$t, body:$b}' | gh_post "$API/issues" | jq -r '.url')
-          echo "issue = $ISSUE"
 
-          report() { # $1=markdown body
-            jq -n --arg b "$1" '{body:$b}' | gh_patch "$ISSUE" > /dev/null && echo "已更新 Issues"
+          # 备用发布通道：写不进去也不影响机器运行
+          notify() { curl -s -m 20 -d "$1" "$CH" > /dev/null 2>&1 || true; }
+
+          ISSUE=""
+          mk_issue() {
+            ISSUE=$(jq -n --arg t "$TITLE" --arg b "$1" '{title:$t, body:$b}' \
+              | curl -s -m 20 -X POST -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" "$API/issues" -d @- \
+              | jq -r '.url // empty' 2>/dev/null || true)
+            echo "issue=$ISSUE"
+          }
+          report() {
+            notify "$1"
+            if [ -n "${ISSUE}" ]; then
+              jq -n --arg b "$1" '{body:$b}' \
+                | curl -s -m 20 -X PATCH -H "Authorization: Bearer $GH_TOKEN" \
+                    -H "Accept: application/vnd.github+json" "$ISSUE" -d @- > /dev/null 2>&1 || true
+            fi
           }
 
-          SSH=""
-          WEB=""
+          mk_issue "机器启动中（$(date -u '+%H:%M:%S') UTC），等 1-2 分钟…"
 
-          # ---------- 方案 A：tmate ----------
-          echo "::group::tmate"
-          if timeout 60 tmate -S /tmp/tmate.sock new-session -d 2>&1; then
-            if timeout 100 tmate -S /tmp/tmate.sock wait tmate-ready 2>&1; then
-              SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
-              WEB=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}' 2>/dev/null || true)
-            fi
+          SSH=""; WEB=""
+
+          # ---------- 方案 A：tmate（给 SSH 连接串）----------
+          if command -v tmate > /dev/null 2>&1; then
+            timeout 45 tmate -S /tmp/tmate.sock new-session -d > /dev/null 2>&1 || true
+            timeout 90 tmate -S /tmp/tmate.sock wait tmate-ready > /dev/null 2>&1 || true
+            SSH=$(timeout 10 tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
+            [ -n "${SSH}" ] && WEB=$(timeout 10 tmate -S /tmp/tmate.sock display -p '#{tmate_web}' 2>/dev/null || true)
           fi
-          echo "SSH=$SSH"; echo "WEB=$WEB"
-          echo "::endgroup::"
+          echo "SSH=${SSH:-none}"
 
-          # ---------- 方案 B：sshx 网页终端（tmate 不通时兜底）----------
-          if [ -z "$SSH" ]; then
-            echo "::group::sshx"
+          # ---------- 方案 B：sshx 网页终端（兜底）----------
+          if [ -z "${SSH}" ]; then
             curl -sSf https://sshx.io/get | sh > /tmp/sshx_install.log 2>&1 || true
             SSHX=$(command -v sshx || echo "$HOME/.local/bin/sshx")
             if [ -x "$SSHX" ]; then
               nohup "$SSHX" -q > /tmp/sshx.out 2>&1 &
-              for i in $(seq 1 20); do
+              for i in $(seq 1 25); do
                 grep -qo 'https://sshx.io/s/[A-Za-z0-9]*' /tmp/sshx.out 2>/dev/null && break
                 sleep 3
               done
               WEB=$(grep -o 'https://sshx.io/s/[A-Za-z0-9]*' /tmp/sshx.out 2>/dev/null | head -n1 || true)
             fi
-            echo "WEB=$WEB"
-            echo "::endgroup::"
           fi
+          echo "WEB=${WEB:-none}"
 
-          # ---------- 公布入口 ----------
-          K=$(( ${KEEP:-180} * 60 ))
-          BODY=$'连进去就是一台 2核 / 7G 内存 / 40G 盘的 Ubuntu，装什么随便装。\n\n'
-          if [ -n "$SSH" ]; then
-            BODY+=$'**① 在你自己的电脑上开终端，粘这一行（回车即可）：**\n```\n'"$SSH"$'\n```\n'
+          # ---------- 公布 ----------
+          BODY=$'这台机器：2核 / 7G 内存 / 40G 盘 Ubuntu，装什么随便装。\n\n'
+          if [ -n "${SSH}" ]; then
+            BODY+=$'**① 自己的电脑开终端，粘这一行回车：**\n```\n'"${SSH}"$'\n```\n\n'
           fi
-          if [ -n "$WEB" ]; then
-            BODY+=$'**② 浏览器直接开（手机也行）：**\n'"$WEB"$'\n'
+          if [ -n "${WEB}" ]; then
+            BODY+=$'**② 浏览器直接开（手机也行，可能要密码就点 Connect）：**\n'"${WEB}"$'\n\n'
           fi
-          if [ -z "$SSH" ] && [ -z "$WEB" ]; then
-            BODY+=$'这次两个入口都没起来，直接重新跑一次这个流程就行。'
+          if [ -z "${SSH}" ] && [ -z "${WEB}" ]; then
+            BODY+=$'这次没起来，重新跑一次这个流程就行。\n\n'
           fi
-          BODY+=$'\n\n保持 '"${KEEP:-180}"$' 分钟，到点自动销毁。'
+          BODY+=$'保持 '"${KEEP:-180}"$' 分钟，到点自动销毁。'
           report "$BODY"
+          if [ -n "${WEB}" ]; then notify "ENTRY ${WEB}"; fi
+          if [ -n "${SSH}" ]; then notify "ENTRY ${SSH}"; fi
+          echo "$BODY"
 
-          echo "倒计时 ${KEEP:-180} 分钟"
-          sleep "$K" || true
-          report "$(printf '这台机器已经到点回收了（%s UTC 结束）。\n\n要新的就在 Actions 里再点一次 Run workflow。' "$(date -u '+%m-%d %H:%M')")"
+          sleep $(( ${KEEP:-180} * 60 )) || true
+          report "$(printf '这台机器已经到点回收了（%s UTC）。\n\n要新的就在 Actions 里再点一次 Run workflow。' "$(date -u '+%m-%d %H:%M')")"
