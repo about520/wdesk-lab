@@ -1,9 +1,10 @@
 name: 开一台临时交互式机器（SSH）
 
-# 跑起来之后会给你一个 ssh 连接串：
-#   一台 2 核 / 7G 内存 / 40G 盘的 Ubuntu，随便装随便玩。
-# 连接串会自动贴到本仓库的 Issues 里（标题 MACHINE-xxxx），随时能翻。
-# 单个 job 最长约 6 小时，到点自动销毁。
+# 跑起来会给你一个能登进去的入口，两种形态，能拿到哪个给哪个：
+#   ① SSH 连接串（ssh xxxx@nyc1.tmate.io）
+#   ② 网页终端地址（浏览器打开直接就是命令行，手机上也能用）
+# 入口地址会自动贴到本仓库的 Issues 里（标题 MACHINE-...），随时能翻。
+# 机器是 2 核 / 7G 内存 / 40G 盘，单个 job 最长约 6 小时，到点自动销毁。
 
 on:
   workflow_dispatch:
@@ -24,42 +25,85 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 预装点常用东西
+      - name: 预装常用工具
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq tmux htop vim curl wget git jq unzip ripgrep net-tools
+          sudo apt-get install -y -qq tmux htop vim curl wget git jq unzip ripgrep net-tools tmate || true
+          tmate -V || echo "apt 版 tmate 不可用"
 
-      - name: 装 tmate
-        run: |
-          if ! sudo apt-get install -y -qq tmate; then
-            curl -fsSL -o /tmp/tmate.tar.xz \
-              https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-static-linux-amd64.tar.xz
-            sudo tar -xJf /tmp/tmate.tar.xz -C /usr/local/bin --strip-components=1
-          fi
-          tmate -V
-
-      - name: 开 SSH 会话并把连接串贴到 Issues
+      - name: 开机器并公布入口
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           KEEP: ${{ inputs.keep_minutes }}
         run: |
-          set -e
-          tmate -S /tmp/tmate.sock new-session -d
-          tmate -S /tmp/tmate.sock wait tmate-ready
-          SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}')
-          WEB=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}')
-          echo "::notice::SSH = $SSH"
-          echo "SSH = $SSH"
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
 
-          BODY=$'连进去就是一台 2核/7G/40G 的 Ubuntu，装什么随便装。\n\n**SSH 连接串（复制这一行）：**\n```\n'"$SSH"$'\n```\n\n**浏览器里直接开终端：**\n'"$WEB"$'\n\n最长 '"${KEEP:-180}"$' 分钟，到点自动销毁。'
-          jq -n --arg t "MACHINE $(date -u +%m-%d\ %H:%M)" --arg b "$BODY" \
-            '{title:$t, body:$b}' > /tmp/issue.json
-          curl -sf -X POST \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/${GITHUB_REPOSITORY}/issues \
-            -d @/tmp/issue.json > /dev/null && echo "连接串已贴到 Issues"
+          gh_post() {  # $1=url $2=json
+            curl -sf -X POST -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" "$1" -d "$2"
+          }
+          gh_patch() { # $1=url $2=json
+            curl -sf -X PATCH -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" "$1" -d "$2"
+          }
 
-          echo "倒计时开始：${KEEP:-180} 分钟"
-          sleep $((${KEEP:-180} * 60)) || true
-          echo "机器回收"
+          TITLE="MACHINE $(date -u '+%m-%d %H:%M UTC')"
+          START=$(date -u '+%H:%M:%S')
+          ISSUE=$(jq -n --arg t "$TITLE" \
+              --arg b "机器启动中（$START UTC），等 1-2 分钟…" \
+              '{title:$t, body:$b}' | gh_post "$API/issues" | jq -r '.url')
+          echo "issue = $ISSUE"
+
+          report() { # $1=markdown body
+            jq -n --arg b "$1" '{body:$b}' | gh_patch "$ISSUE" > /dev/null && echo "已更新 Issues"
+          }
+
+          SSH=""
+          WEB=""
+
+          # ---------- 方案 A：tmate ----------
+          echo "::group::tmate"
+          if timeout 60 tmate -S /tmp/tmate.sock new-session -d 2>&1; then
+            if timeout 100 tmate -S /tmp/tmate.sock wait tmate-ready 2>&1; then
+              SSH=$(tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}' 2>/dev/null || true)
+              WEB=$(tmate -S /tmp/tmate.sock display -p '#{tmate_web}' 2>/dev/null || true)
+            fi
+          fi
+          echo "SSH=$SSH"; echo "WEB=$WEB"
+          echo "::endgroup::"
+
+          # ---------- 方案 B：sshx 网页终端（tmate 不通时兜底）----------
+          if [ -z "$SSH" ]; then
+            echo "::group::sshx"
+            curl -sSf https://sshx.io/get | sh > /tmp/sshx_install.log 2>&1 || true
+            SSHX=$(command -v sshx || echo "$HOME/.local/bin/sshx")
+            if [ -x "$SSHX" ]; then
+              nohup "$SSHX" -q > /tmp/sshx.out 2>&1 &
+              for i in $(seq 1 20); do
+                grep -qo 'https://sshx.io/s/[A-Za-z0-9]*' /tmp/sshx.out 2>/dev/null && break
+                sleep 3
+              done
+              WEB=$(grep -o 'https://sshx.io/s/[A-Za-z0-9]*' /tmp/sshx.out 2>/dev/null | head -n1 || true)
+            fi
+            echo "WEB=$WEB"
+            echo "::endgroup::"
+          fi
+
+          # ---------- 公布入口 ----------
+          K=$(( ${KEEP:-180} * 60 ))
+          BODY=$'连进去就是一台 2核 / 7G 内存 / 40G 盘的 Ubuntu，装什么随便装。\n\n'
+          if [ -n "$SSH" ]; then
+            BODY+=$'**① 在你自己的电脑上开终端，粘这一行（回车即可）：**\n```\n'"$SSH"$'\n```\n'
+          fi
+          if [ -n "$WEB" ]; then
+            BODY+=$'**② 浏览器直接开（手机也行）：**\n'"$WEB"$'\n'
+          fi
+          if [ -z "$SSH" ] && [ -z "$WEB" ]; then
+            BODY+=$'这次两个入口都没起来，直接重新跑一次这个流程就行。'
+          fi
+          BODY+=$'\n\n保持 '"${KEEP:-180}"$' 分钟，到点自动销毁。'
+          report "$BODY"
+
+          echo "倒计时 ${KEEP:-180} 分钟"
+          sleep "$K" || true
+          report "$(printf '这台机器已经到点回收了（%s UTC 结束）。\n\n要新的就在 Actions 里再点一次 Run workflow。' "$(date -u '+%m-%d %H:%M')")"
