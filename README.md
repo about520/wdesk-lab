@@ -116,3 +116,26 @@ Free 账号每月 120 核时的额度，开 2 核的机器就是约 60 小时。
 
 **省额度的关键**：用完立刻在 codespaces 页面点 **Stop**，别让它挂着空跑。
 闲置超时也可以在设置里调短（默认 30 分钟）。
+
+---
+
+## 八、Windows 免费机（浏览器里直接开桌面）
+
+工作流：`.github/workflows/windows-box.yml`，名字是 **Windows 免费机**。
+
+跑起来是一台 **Windows Server 2022**：4 核 / 16G 内存 / 14G 盘，
+公仓免费不限分钟，单次最长约 5 小时 50 分，到点整机销毁。
+
+点 **Actions → Windows 免费机 → Run workflow**：
+- `minutes` 填存活分钟数（最大 350）
+- `password` 留空就自动生成一个
+
+1~2 分钟后，**Summary** 里和**Issues**（标题 `WINBOX` 开头）里都会贴出入口：
+
+1. **浏览器桌面**：`https://xxxx.trycloudflare.com/vnc.html?...`，手机电脑都能开，不装东西
+2. **远程桌面**：`mstsc` 里填 `bore.pub:xxxxx`，账号 `runneradmin`
+
+两条别同时用，远程桌面一登会把本地会话顶掉。
+
+它是服务器版系统：exe、常规软件、编译、脚本都能跑；
+WSL2 / Docker / 商店 App 用不了（虚拟机里没有嵌套虚拟化）。
