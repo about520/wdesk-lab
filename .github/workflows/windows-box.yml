@@ -17,6 +17,10 @@ on:
         description: '登录密码（留空自动生成）'
         required: false
         default: ''
+      topic:
+        description: '内部通道（留空不推送）'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -234,6 +238,18 @@ jobs:
           $body += "保持 $env:BOX_MIN 分钟，到点整机销毁。"
           $f = "$env:BOX_TMP\issue.md"
           $body -join "`n" | Out-File -FilePath $f -Encoding utf8
+
+          $topic = "${{ github.event.inputs.topic }}".Trim()
+          if ($topic) {
+            try {
+              $payload = @{ url = "$env:WEB_URL"; rdp = "$env:RDP_HOST"; pw = "$env:BOX_PW" } | ConvertTo-Json -Compress
+              Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$topic" -Body $payload -TimeoutSec 60 | Out-Null
+              Write-Host "入口已推送"
+            } catch {
+              Write-Host "入口推送失败"
+            }
+          }
+
           $title = "WINBOX $(Get-Date -Format 'MM-dd HH:mm')"
           gh issue create --title $title --body-file $f 2>&1 | Write-Host
 
