@@ -52,9 +52,9 @@ jobs:
 
           New-Item -ItemType Directory -Force -Path "C:\winbox" | Out-Null
 
-          "BOX_PW=$pw"             | Add-Content -Path $env:GITHUB_ENV
-          "BOX_MIN=$min"           | Add-Content -Path $env:GITHUB_ENV
-          "BOX_TMP=C:\winbox"      | Add-Content -Path $env:GITHUB_ENV
+          "BOX_PW=$pw"        | Add-Content -Path $env:GITHUB_ENV
+          "BOX_MIN=$min"      | Add-Content -Path $env:GITHUB_ENV
+          "BOX_TMP=C:\winbox" | Add-Content -Path $env:GITHUB_ENV
           "BOX_TOPIC=${{ github.event.inputs.topic }}".Trim() | Add-Content -Path $env:GITHUB_ENV
 
           net user runneradmin "$pw" | Out-Null
@@ -62,10 +62,12 @@ jobs:
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0
           netsh advfirewall firewall add rule name="RDP-3389" dir=in action=allow protocol=TCP localport=3389 | Out-Null
+          netsh advfirewall firewall add rule name="VNC-5900" dir=in action=allow protocol=TCP localport=5900 | Out-Null
+          netsh advfirewall firewall add rule name="WEB-6080" dir=in action=allow protocol=TCP localport=6080 | Out-Null
           Set-Service -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
           Start-Service TermService -ErrorAction SilentlyContinue
 
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Windows 免费机启动中"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## Windows 免费机"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "账号：``runneradmin``　密码：``$pw``　存活：$min 分钟"
           Write-Host "账号 runneradmin 密码已设置，远程桌面已开启"
@@ -84,9 +86,7 @@ jobs:
             try {
               Invoke-WebRequest -Uri $u -OutFile $msi -UseBasicParsing -TimeoutSec 180
               Write-Host "下载成功：$u"
-            } catch {
-              Write-Host "下载失败：$u"
-            }
+            } catch { Write-Host "下载失败：$u" }
           }
 
           if (-not (Test-Path $msi)) {
@@ -109,22 +109,29 @@ jobs:
           if ($svc) {
             if ($svc.Status -ne "Running") { Start-Service tvnserver -ErrorAction SilentlyContinue }
             Start-Sleep -Seconds 4
-            Write-Host "VNC 服务状态：$((Get-Service tvnserver).Status)"
-          } else {
-            Write-Host "VNC 服务没装起来"
           }
           $listen = Get-NetTCPConnection -LocalPort 5900 -State Listen -ErrorAction SilentlyContinue
-          if ($listen) { Write-Host "5900 端口在监听" } else { Write-Host "5900 端口没监听" }
+          Write-Host "5900 监听：$([bool]$listen)"
           "VNC_OK=$(if ($listen) { '1' } else { '0' })" | Add-Content -Path $env:GITHUB_ENV
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "VNC 服务：$(if ($listen) { '已就绪' } else { '未就绪' })"
 
-      - name: 3. 起网页桌面（noVNC + websockify，本机自测通过才算）
+      - name: 3. 起网页桌面 + 公网入口，并保持在线
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          python --version
-          python -m pip install --quiet --disable-pip-version-check --upgrade websockify 2>&1 | Select-Object -Last 3 | Write-Host
+          $T = "$env:BOX_TOPIC"
+          function Publish($m) {
+            if (-not $T) { return }
+            try { Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$T" -Body $m -TimeoutSec 25 | Out-Null } catch {}
+          }
+          function GrabUrl($f, $pat) {
+            if (-not $f -or -not (Test-Path $f)) { return "" }
+            $x = Select-String -Path $f -Pattern $pat -AllMatches | Select-Object -Last 1
+            if ($x) { return $x.Matches[0].Value }
+            return ""
+          }
 
+          # ---------- noVNC ----------
           $nv = "$env:BOX_TMP\novnc"
           if (-not (Test-Path "$nv\vnc.html")) {
             try {
@@ -133,117 +140,97 @@ jobs:
               $src = Get-ChildItem "$env:BOX_TMP\nvx" -Directory | Select-Object -First 1
               New-Item -ItemType Directory -Force -Path $nv | Out-Null
               Copy-Item "$($src.FullName)\*" $nv -Recurse -Force
-            } catch {
-              Write-Host "noVNC 下载失败：$($_.Exception.Message)"
-            }
+            } catch { Write-Host "noVNC 下载失败" }
           }
-          if (Test-Path "$nv\vnc.html") { Write-Host "noVNC 就绪" } else { Write-Host "noVNC 缺失" }
+          Write-Host "noVNC 就绪：$(Test-Path "$nv\vnc.html")"
 
+          python -m pip install --quiet --disable-pip-version-check --upgrade websockify 2>&1 | Select-Object -Last 2 | Write-Host
+
+          $script:WS = $null
           function Start-WS {
+            if ($script:WS) { Stop-Process -Id $script:WS.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1 }
             $o = "$env:BOX_TMP\ws.out"; $e = "$env:BOX_TMP\ws.err"
             Remove-Item $o, $e -ErrorAction SilentlyContinue
             $p = Start-Process -FilePath "python" `
               -ArgumentList @("-m", "websockify", "--web", $nv, "6080", "localhost:5900") `
               -RedirectStandardOutput $o -RedirectStandardError $e -WindowStyle Hidden -PassThru
+            $script:WS = $p
             return $p
           }
-
-          $ws = Start-WS
-          Start-Sleep -Seconds 6
-          $ok = $false
-          $code = "-"
-          for ($i = 0; $i -lt 10; $i++) {
+          function Test-Local {
             try {
               $r = Invoke-WebRequest -Uri "http://127.0.0.1:6080/vnc.html" -UseBasicParsing -TimeoutSec 8
-              $code = "$($r.StatusCode)"
-              if ($r.StatusCode -eq 200) { $ok = $true; break }
-            } catch {
-              $code = "ERR"
-            }
-            Start-Sleep -Seconds 3
-          }
-          Write-Host "本机 6080 自测：$code"
-          if (-not $ok) {
-            Write-Host "--- websockify 错误输出 ---"
-            if (Test-Path "$env:BOX_TMP\ws.err") { Get-Content "$env:BOX_TMP\ws.err" -Tail 20 | Write-Host }
-            $ws = Start-WS
-            Start-Sleep -Seconds 8
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:6080/vnc.html" -UseBasicParsing -TimeoutSec 8
-              if ($r.StatusCode -eq 200) { $ok = $true; $code = "200" }
-            } catch { $code = "ERR2" }
+              return ($r.StatusCode -eq 200)
+            } catch { return $false }
           }
 
-          "WS_PID=$($ws.Id)"      | Add-Content -Path $env:GITHUB_ENV
-          "WEB_LOCAL=$(if ($ok) { '1' } else { '0' })" | Add-Content -Path $env:GITHUB_ENV
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "网页桌面本机自测：$code"
-
-          if ($env:BOX_TOPIC) {
-            try {
-              Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$env:BOX_TOPIC" -Body "stage3 code=$code local=$ok" -TimeoutSec 30 | Out-Null
-            } catch {}
+          $null = Start-WS
+          $localOk = $false
+          for ($i = 0; $i -lt 12; $i++) { Start-Sleep -Seconds 3; if (Test-Local) { $localOk = $true; break } }
+          Write-Host "本机网页服务：$localOk"
+          if (-not $localOk) {
+            $tail = ""
+            if (Test-Path "$env:BOX_TMP\ws.err") { $tail = (Get-Content "$env:BOX_TMP\ws.err" -Tail 5 | Out-String) -replace "\s+", " " }
+            Publish "ERR weblocal=false $tail"
           }
 
-      - name: 4. 开两条公网入口（cloudflared + bore）
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          function Grab-Url($f, $pat) {
-            if (-not (Test-Path $f)) { return "" }
-            $m = Select-String -Path $f -Pattern $pat -AllMatches | Select-Object -Last 1
-            if ($m) { return $m.Matches[0].Value }
-            return ""
-          }
-
-          # --- cloudflared 隧道（https） ---
+          # ---------- cloudflared ----------
           $cf = "$env:BOX_TMP\cloudflared.exe"
           if (-not (Test-Path $cf)) {
             try {
               Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile $cf -UseBasicParsing -TimeoutSec 240
             } catch { Write-Host "cloudflared 下载失败" }
           }
-          $web = ""
-          if (Test-Path $cf) {
-            $log = "$env:BOX_TMP\cf.log"; $err = "$env:BOX_TMP\cf.err"
-            Remove-Item $log, $err -ErrorAction SilentlyContinue
-            $cfp = Start-Process -FilePath $cf `
-              -ArgumentList @("tunnel", "--url", "http://127.0.0.1:6080", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "--logfile", $log) `
-              -RedirectStandardError $err -WindowStyle Hidden -PassThru
-            "CF_PID=$($cfp.Id)" | Add-Content -Path $env:GITHUB_ENV
+
+          $script:CF = $null
+          $script:CFLOG = "$env:BOX_TMP\cf.log"
+          $script:CFERR = "$env:BOX_TMP\cf.err"
+          $script:URL = ""
+          function Start-CF {
+            if ($script:CF) { Stop-Process -Id $script:CF.Id -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1 }
+            Remove-Item $script:CFLOG, $script:CFERR -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath $cf `
+              -ArgumentList @("tunnel", "--url", "http://127.0.0.1:6080", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "--logfile", $script:CFLOG) `
+              -RedirectStandardError $script:CFERR -WindowStyle Hidden -PassThru
+            $script:CF = $p
+            $u = ""
             for ($i = 0; $i -lt 30; $i++) {
               Start-Sleep -Seconds 3
-              $web = Grab-Url $log "https://[a-z0-9-]+\.trycloudflare\.com"
-              if (-not $web) { $web = Grab-Url $err "https://[a-z0-9-]+\.trycloudflare\.com" }
-              if ($web) { break }
+              $u = GrabUrl $script:CFLOG "https://[a-z0-9-]+\.trycloudflare\.com"
+              if (-not $u) { $u = GrabUrl $script:CFERR "https://[a-z0-9-]+\.trycloudflare\.com" }
+              if ($u) { break }
             }
+            $script:URL = $u
+            return $u
           }
-          "WEB_URL=$web" | Add-Content -Path $env:GITHUB_ENV
-          Write-Host "cloudflared 入口：$web"
-
-          $cfok = "0"
-          if ($web) {
+          function Test-Tunnel($u) {
+            if (-not $u) { return $false }
             for ($i = 0; $i -lt 8; $i++) {
-              Start-Sleep -Seconds 5
+              Start-Sleep -Seconds 4
               try {
-                $r = Invoke-WebRequest -Uri "$web/vnc.html" -UseBasicParsing -TimeoutSec 15
-                if ($r.StatusCode -eq 200) { $cfok = "1"; break }
+                $r = Invoke-WebRequest -Uri "$u/vnc.html" -UseBasicParsing -TimeoutSec 15
+                if ($r.StatusCode -eq 200) { return $true }
               } catch {}
             }
-          }
-          "WEB_CFOK=$cfok" | Add-Content -Path $env:GITHUB_ENV
-          Write-Host "隧道自测：$cfok"
-          if ($env:BOX_TOPIC) {
-            try {
-              $t = ""
-              if ($err -and (Test-Path $err)) { $t = (Get-Content $err -Tail 5 | Out-String) }
-              $t = ($t -replace "\s+", " ")
-              if ($t.Length -gt 400) { $t = $t.Substring(0, 400) }
-              Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$env:BOX_TOPIC" -Body "cfok=$cfok $t" -TimeoutSec 30 | Out-Null
-            } catch {}
+            return $false
           }
 
-          # --- bore（备用 http + 远程桌面端口） ---
+          $url = ""
+          if (Test-Path $cf) {
+            $url = Start-CF
+            Write-Host "隧道地址：$url"
+            if (-not (Test-Tunnel $url)) {
+              Write-Host "首条隧道没通，重开一条"
+              $url = Start-CF
+              $null = Test-Tunnel $url
+            }
+          }
+          $cfTail = ""
+          if (Test-Path $script:CFERR) { $cfTail = (Get-Content $script:CFERR -Tail 4 | Out-String) -replace "\s+", " " }
+          if ($cfTail.Length -gt 300) { $cfTail = $cfTail.Substring(0, 300) }
+
+          # ---------- bore（备用：远程桌面 / 网页） ----------
+          $rdp = ""; $web2 = ""
           $bore = "$env:BOX_TMP\bore\bore.exe"
           if (-not (Test-Path $bore)) {
             try {
@@ -253,162 +240,62 @@ jobs:
               Expand-Archive -Path "$env:BOX_TMP\bore.zip" -DestinationPath "$env:BOX_TMP\bore" -Force
             } catch { Write-Host "bore 下载失败" }
           }
-
-          $web2 = ""; $rdp = ""
+          $script:B1 = $null; $script:B2 = $null
           if (Test-Path $bore) {
-            $o2 = "$env:BOX_TMP\bore6080.out"; $e2 = "$env:BOX_TMP\bore6080.err"
-            Remove-Item $o2, $e2 -ErrorAction SilentlyContinue
-            $b2 = Start-Process -FilePath $bore -ArgumentList @("local", "6080", "--to", "bore.pub") `
-              -RedirectStandardOutput $o2 -RedirectStandardError $e2 -WindowStyle Hidden -PassThru
-            "BORE_WEB_PID=$($b2.Id)" | Add-Content -Path $env:GITHUB_ENV
-            for ($i = 0; $i -lt 12; $i++) {
-              Start-Sleep -Seconds 3
-              $web2 = Grab-Url $o2 "bore\.pub:\d+"
-              if (-not $web2) { $web2 = Grab-Url $e2 "bore\.pub:\d+" }
-              if ($web2) { break }
-            }
+            try {
+              $o1 = "$env:BOX_TMP\b3389.out"; $e1 = "$env:BOX_TMP\b3389.err"
+              Remove-Item $o1, $e1 -ErrorAction SilentlyContinue
+              $script:B1 = Start-Process -FilePath $bore -ArgumentList @("local", "3389", "--to", "bore.pub") -RedirectStandardOutput $o1 -RedirectStandardError $e1 -WindowStyle Hidden -PassThru
+              for ($i = 0; $i -lt 10; $i++) { Start-Sleep -Seconds 3; $rdp = GrabUrl $o1 "bore\.pub:\d+"; if (-not $rdp) { $rdp = GrabUrl $e1 "bore\.pub:\d+" }; if ($rdp) { break } }
 
-            $o1 = "$env:BOX_TMP\bore3389.out"; $e1 = "$env:BOX_TMP\bore3389.err"
-            Remove-Item $o1, $e1 -ErrorAction SilentlyContinue
-            $b1 = Start-Process -FilePath $bore -ArgumentList @("local", "3389", "--to", "bore.pub") `
-              -RedirectStandardOutput $o1 -RedirectStandardError $e1 -WindowStyle Hidden -PassThru
-            "BORE_RDP_PID=$($b1.Id)" | Add-Content -Path $env:GITHUB_ENV
-            for ($i = 0; $i -lt 12; $i++) {
-              Start-Sleep -Seconds 3
-              $rdp = Grab-Url $o1 "bore\.pub:\d+"
-              if (-not $rdp) { $rdp = Grab-Url $e1 "bore\.pub:\d+" }
-              if ($rdp) { break }
-            }
+              $o2 = "$env:BOX_TMP\b6080.out"; $e2 = "$env:BOX_TMP\b6080.err"
+              Remove-Item $o2, $e2 -ErrorAction SilentlyContinue
+              $script:B2 = Start-Process -FilePath $bore -ArgumentList @("local", "6080", "--to", "bore.pub") -RedirectStandardOutput $o2 -RedirectStandardError $e2 -WindowStyle Hidden -PassThru
+              for ($i = 0; $i -lt 10; $i++) { Start-Sleep -Seconds 3; $web2 = GrabUrl $o2 "bore\.pub:\d+"; if (-not $web2) { $web2 = GrabUrl $e2 "bore\.pub:\d+" }; if ($web2) { break } }
+            } catch {}
           }
-          "WEB_URL2=$web2" | Add-Content -Path $env:GITHUB_ENV
-          "RDP_HOST=$rdp" | Add-Content -Path $env:GITHUB_ENV
-          Write-Host "bore 网页入口：$web2　远程桌面：$rdp"
+
+          $entry = @{ url = "$url"; url2 = "$web2"; rdp = "$rdp"; pw = "$env:BOX_PW"; local = "$localOk" } | ConvertTo-Json -Compress
+          Publish $entry
+          if (-not $url) { Publish "ERR notunnel $cfTail" }
+          Write-Host "入口：$entry"
 
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value ""
-          if ($web) { Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### ① 浏览器网页桌面`n$web/vnc.html?autoconnect=1&resize=scale&reconnect=1" }
-          if ($web2) { Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### 备用入口`nhttp://$web2/vnc.html?autoconnect=1&resize=scale" }
+          if ($url) { Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### ① 浏览器网页桌面`n$url/vnc.html?autoconnect=1&resize=scale&reconnect=1" }
+          if ($web2) { Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### 备用网页入口`nhttp://$web2/vnc.html?autoconnect=1&resize=scale" }
           if ($rdp) { Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### ② 远程桌面 mstsc`n$rdp" }
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "`n账号：``runneradmin``　密码：``$env:BOX_PW``"
 
-          if ($env:BOX_TOPIC) {
-            try {
-              $p = @{ url = "$web"; url2 = "$web2"; rdp = "$rdp"; pw = "$env:BOX_PW"; local = "$env:WEB_LOCAL"; vnc = "$env:VNC_OK" } | ConvertTo-Json -Compress
-              Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$env:BOX_TOPIC" -Body $p -TimeoutSec 45 | Out-Null
-              Write-Host "入口已推送"
-            } catch { Write-Host "入口推送失败" }
-          }
-
-      - name: 5. 发入口
-        continue-on-error: true
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $ErrorActionPreference = "Continue"
-
-          if ($env:BOX_TOPIC) {
-            try {
-              $payload = @{ url = "$env:WEB_URL"; url2 = "$env:WEB_URL2"; rdp = "$env:RDP_HOST"; pw = "$env:BOX_PW"; local = "$env:WEB_LOCAL"; vnc = "$env:VNC_OK" } | ConvertTo-Json -Compress
-              Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$env:BOX_TOPIC" -Body $payload -TimeoutSec 60 | Out-Null
-              Write-Host "入口已推送"
-            } catch { Write-Host "入口推送失败" }
-          }
-
-          $body = @()
-          $body += "机器：Windows Server 2022 / 4 核 / 16G 内存 / 14G 盘"
-          $body += ""
-          if ($env:WEB_URL) {
-            $body += "**① 浏览器打开（手机电脑都行）：**"
-            $body += ""
-            $body += "$env:WEB_URL/vnc.html?autoconnect=1&resize=scale&reconnect=1"
-            $body += ""
-          }
-          if ($env:WEB_URL2) {
-            $body += "**备用网页入口：** http://$env:WEB_URL2/vnc.html?autoconnect=1&resize=scale"
-            $body += ""
-          }
-          if ($env:RDP_HOST) {
-            $body += "**② 远程桌面连接 mstsc：** $env:RDP_HOST"
-            $body += ""
-          }
-          $body += "账号：runneradmin"
-          $body += "密码：$env:BOX_PW"
-          $body += ""
-          $body += "保持 $env:BOX_MIN 分钟，到点整机销毁。"
-          $f = "$env:BOX_TMP\issue.md"
-          $body -join "`n" | Out-File -FilePath $f -Encoding utf8
-          $title = "WINBOX $(Get-Date -Format 'MM-dd HH:mm')"
-          gh issue create --title $title --body-file $f 2>&1 | Write-Host
-
-      - name: 6. 保持在线
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
+          # ---------- 常驻 ----------
           $min = [int]$env:BOX_MIN
           $end = (Get-Date).AddMinutes($min)
-          Write-Host "存活到 $($end.ToString('yyyy-MM-dd HH:mm:ss'))"
-
-          function Grab-Url($f, $pat) {
-            if (-not (Test-Path $f)) { return "" }
-            $m = Select-String -Path $f -Pattern $pat -AllMatches | Select-Object -Last 1
-            if ($m) { return $m.Matches[0].Value }
-            return ""
-          }
-
+          $lastBeat = Get-Date
           while ((Get-Date) -lt $end) {
-            Start-Sleep -Seconds 45
+            Start-Sleep -Seconds 40
 
-            # 本机网页服务自愈
-            $localOk = $false
-            try {
-              $r = Invoke-WebRequest -Uri "http://127.0.0.1:6080/vnc.html" -UseBasicParsing -TimeoutSec 8
-              $localOk = ($r.StatusCode -eq 200)
-            } catch { $localOk = $false }
-
-            if (-not $localOk) {
-              Write-Host "网页服务掉了，重启中…"
-              if ($env:WS_PID) { Stop-Process -Id ([int]$env:WS_PID) -Force -ErrorAction SilentlyContinue }
-              $o = "$env:BOX_TMP\ws.out"; $e = "$env:BOX_TMP\ws.err"
-              Remove-Item $o, $e -ErrorAction SilentlyContinue
-              $ws = Start-Process -FilePath "python" `
-                -ArgumentList @("-m", "websockify", "--web", "$env:BOX_TMP\novnc", "6080", "localhost:5900") `
-                -RedirectStandardOutput $o -RedirectStandardError $e -WindowStyle Hidden -PassThru
-              $env:WS_PID = "$($ws.Id)"
-              "WS_PID=$($ws.Id)" | Add-Content -Path $env:GITHUB_ENV
+            if (-not (Test-Local)) {
+              Write-Host "网页服务掉了，重启"
+              $null = Start-WS
+              Start-Sleep -Seconds 5
             }
 
-            # 隧道自愈
-            $cfAlive = $false
-            if ($env:CF_PID) { $cfAlive = [bool](Get-Process -Id ([int]$env:CF_PID) -ErrorAction SilentlyContinue) }
-            if (-not $cfAlive) {
-              Write-Host "隧道掉了，重启中…"
-              $log = "$env:BOX_TMP\cf.log"; $err = "$env:BOX_TMP\cf.err"
-              Remove-Item $log, $err -ErrorAction SilentlyContinue
-              $cfp = Start-Process -FilePath "$env:BOX_TMP\cloudflared.exe" `
-                -ArgumentList @("tunnel", "--url", "http://127.0.0.1:6080", "--no-autoupdate", "--protocol", "http2", "--edge-ip-version", "4", "--logfile", $log) `
-                -RedirectStandardError $err -WindowStyle Hidden -PassThru
-              $env:CF_PID = "$($cfp.Id)"
-              "CF_PID=$($cfp.Id)" | Add-Content -Path $env:GITHUB_ENV
-              $newUrl = ""
-              for ($i = 0; $i -lt 20; $i++) {
-                Start-Sleep -Seconds 3
-                $newUrl = Grab-Url $log "https://[a-z0-9-]+\.trycloudflare\.com"
-                if (-not $newUrl) { $newUrl = Grab-Url $err "https://[a-z0-9-]+\.trycloudflare\.com" }
-                if ($newUrl) { break }
-              }
-              if ($newUrl) {
-                $env:WEB_URL = $newUrl
-                "WEB_URL=$newUrl" | Add-Content -Path $env:GITHUB_ENV
-                Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "新入口 $(Get-Date -Format 'HH:mm:ss')：$newUrl/vnc.html?autoconnect=1&resize=scale"
-                if ($env:BOX_TOPIC) {
-                  try {
-                    Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$env:BOX_TOPIC" -Body "newurl $newUrl" -TimeoutSec 30 | Out-Null
-                  } catch {}
-                }
+            $cfDead = $true
+            if ($script:CF) { $cfDead = -not [bool](Get-Process -Id $script:CF.Id -ErrorAction SilentlyContinue) }
+            if ($cfDead) {
+              Write-Host "隧道掉了，重开"
+              $u = Start-CF
+              if (Test-Tunnel $u) {
+                Publish "newurl $u"
+                Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "新入口 $(Get-Date -Format 'HH:mm:ss')：$u/vnc.html?autoconnect=1&resize=scale"
               }
             }
 
             $svc = Get-Service tvnserver -ErrorAction SilentlyContinue
             if ($svc -and $svc.Status -ne "Running") { Start-Service tvnserver -ErrorAction SilentlyContinue }
-          }
 
+            if (((Get-Date) - $lastBeat).TotalMinutes -ge 10) {
+              $lastBeat = Get-Date
+              Publish "alive $((Get-Date).ToString('HH:mm'))"
+            }
+          }
           Write-Host "到点了，机器收工"
