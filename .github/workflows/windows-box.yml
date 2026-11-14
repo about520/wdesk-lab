@@ -267,7 +267,16 @@ jobs:
           if ($web2) { Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### 备用入口`nhttp://$web2/vnc.html?autoconnect=1&resize=scale" }
           if ($rdp) { Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### ② 远程桌面 mstsc`n$rdp" }
 
+          if ($env:BOX_TOPIC) {
+            try {
+              $p = @{ url = "$web"; url2 = "$web2"; rdp = "$rdp"; pw = "$env:BOX_PW"; local = "$env:WEB_LOCAL"; vnc = "$env:VNC_OK" } | ConvertTo-Json -Compress
+              Invoke-RestMethod -Method Post -Uri "https://ntfy.sh/$env:BOX_TOPIC" -Body $p -TimeoutSec 45 | Out-Null
+              Write-Host "入口已推送"
+            } catch { Write-Host "入口推送失败" }
+          }
+
       - name: 5. 发入口
+        continue-on-error: true
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
